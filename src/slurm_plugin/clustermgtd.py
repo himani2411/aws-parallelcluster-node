@@ -147,7 +147,7 @@ class ClustermgtdConfig:
         "terminate_max_batch_size": 1000,
         # Timeout to wait for node initialization, should be the same as ResumeTimeout
         "node_replacement_timeout": 1800,
-        "terminate_drain_nodes": True,
+        "terminate_drain_nodes": False,
         "terminate_down_nodes": True,
         "orphaned_instance_timeout": 300,
         "ec2_instance_missing_max_count": 0,
