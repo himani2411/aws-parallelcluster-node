@@ -32,7 +32,7 @@ event_logger = log.getChild("events")
 class SlurmResumeConfig:
     DEFAULTS = {
         "max_retry": 1,
-        "launch_max_batch_size": 500,
+        "launch_max_batch_size": 750,
         "assign_node_max_batch_size": 500,
         "terminate_max_batch_size": 1000,
         "update_node_address": True,

@@ -137,7 +137,7 @@ class ClustermgtdConfig:
             os.path.dirname(__file__), "logging", "parallelcluster_clustermgtd_logging.conf"
         ),
         # Launch configs
-        "launch_max_batch_size": 500,
+        "launch_max_batch_size": 750,
         "assign_node_max_batch_size": 500,
         "update_node_address": True,
         "run_instances_overrides": "/opt/slurm/etc/pcluster/run_instances_overrides.json",
