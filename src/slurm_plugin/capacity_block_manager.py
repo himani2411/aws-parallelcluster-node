@@ -59,11 +59,12 @@ class CapacityBlock:
     - name of the slurm reservation that will be created for this CB.
     """
 
-    def __init__(self, capacity_block_id):
+    def __init__(self, capacity_block_id, is_group_mode=False):
         self.capacity_block_id = capacity_block_id
         self.compute_resources_map: Dict[str, set] = {}
         self._capacity_block_reservation_info = None
         self._nodenames = []
+        self.is_group_mode = is_group_mode
 
     def update_capacity_block_reservation_info(self, capacity_block_reservation_info: CapacityReservationInfo):
         """Update info from CapacityReservationInfo."""
@@ -170,10 +171,16 @@ class CapacityBlockManager:
                         if not slurm_reservation_updated:
                             self._slurm_reservation_update_errors += 1
 
-                        # If CB is in not yet active or expired add nodes to list of reserved nodes,
-                        # only if slurm reservation has been correctly created/updated
+                        # If CB is not yet active, add nodes to list of reserved nodes,
+                        # only if slurm reservation has been correctly created/updated.
+                        # For group-mode expired CBs, do NOT reserve nodes — the capacity is gone
+                        # and remaining active CBs in the group can still serve launches.
                         if slurm_reservation_updated and not capacity_block.is_active():
-                            reserved_nodenames.extend(capacity_block.nodenames())
+                            if capacity_block.is_group_mode and capacity_block.state() == "expired":
+                                # Don't reserve nodes for expired group-mode CBs
+                                pass
+                            else:
+                                reserved_nodenames.extend(capacity_block.nodenames())
 
                 # If all Slurm reservation actions failed do not update object attributes
                 if (
@@ -223,12 +230,47 @@ class CapacityBlockManager:
         Update capacity_block info adding nodenames list.
 
         Check configured CBs and associate nodes to them according to queue and compute resource info.
+
+        For group-mode CBs (multiple CBs sharing the same compute resource via GroupARN),
+        nodes are distributed proportionally across CBs rather than assigning all nodes to each CB.
+        This ensures that when some CBs are inactive, only a proportional subset of nodes is held.
         """
+        # Collect group-mode CBs and their nodes separately
+        group_cbs_by_compute_resource: Dict[tuple, Dict] = {}  # key: (queue, cr_name) → {"cbs": [], "nodes": []}
+
         for node in nodes:
+            matched = False
             for capacity_block in capacity_blocks.values():
                 if capacity_block.does_node_belong_to(node):
-                    capacity_block.add_nodename(node.name)
+                    if capacity_block.is_group_mode:
+                        key = (node.queue_name, node.compute_resource_name)
+                        if key not in group_cbs_by_compute_resource:
+                            group_cbs_by_compute_resource[key] = {"cbs": [], "nodes": []}
+                        group_cbs_by_compute_resource[key]["nodes"].append(node.name)
+                        # Collect unique CBs for this compute resource
+                        if capacity_block not in group_cbs_by_compute_resource[key]["cbs"]:
+                            group_cbs_by_compute_resource[key]["cbs"].append(capacity_block)
+                    else:
+                        # Existing 1:1 behavior — assign node to the matching CB
+                        capacity_block.add_nodename(node.name)
+                    matched = True
                     break
+            if not matched:
+                logger.debug("Node %s does not belong to any capacity block.", node.name)
+
+        # Distribute nodes proportionally across group-mode CBs
+        for key, data in group_cbs_by_compute_resource.items():
+            cbs = data["cbs"]
+            node_names = data["nodes"]
+            nodes_per_cb = len(node_names) // len(cbs)
+            remainder = len(node_names) % len(cbs)
+
+            idx = 0
+            for i, cb in enumerate(cbs):
+                count = nodes_per_cb + (1 if i < remainder else 0)
+                for node_name in node_names[idx:idx + count]:
+                    cb.add_nodename(node_name)
+                idx += count
 
     def _cleanup_leftover_slurm_reservations(self):
         """Find list of slurm reservations created by ParallelCluster but not part of the configured CBs."""
@@ -276,6 +318,11 @@ class CapacityBlockManager:
         A CB has five possible states: payment-pending, pending, active, expired and payment-failed,
         we need to create/delete Slurm reservation accordingly.
 
+        For group-mode CBs (multiple CBs sharing the same compute resource via GroupARN):
+        - Expired CBs: do NOT hold nodes. The capacity is gone (EC2 already killed the instance).
+          Holding nodes would block launches on remaining active CBs in the group.
+        - Pending CBs: hold proportionally assigned nodes (same as 1:1 mode).
+
         Pass do_update to True only if you want to update already created reservations
         (e.g. to update the node list or when the CapacityBlockManager is not yet initialized).
 
@@ -284,9 +331,11 @@ class CapacityBlockManager:
 
         def _log_cb_info(action_info):
             logger.info(
-                "Capacity Block reservation %s is in state %s. %s Slurm reservation %s for nodes %s.",
+                "Capacity Block reservation %s is in state %s (group_mode=%s). "
+                "%s Slurm reservation %s for nodes %s.",
                 capacity_block.capacity_block_id,
                 capacity_block.state(),
+                capacity_block.is_group_mode,
                 action_info,
                 slurm_reservation_name,
                 capacity_block_nodenames,
@@ -298,8 +347,18 @@ class CapacityBlockManager:
 
         try:
             reservation_exists = is_slurm_reservation(name=slurm_reservation_name)
+
+            # Group-mode expired CBs: don't hold nodes, just clean up any existing reservation.
+            # The capacity is gone — EC2 killed the instance already.
+            # Holding nodes would block launches on remaining active CBs in the group.
+            if capacity_block.is_group_mode and capacity_block.state() == "expired":
+                if reservation_exists:
+                    _log_cb_info("Deleting (group-mode expired, not holding nodes)")
+                    delete_slurm_reservation(name=slurm_reservation_name)
+                else:
+                    _log_cb_info("Nothing to do. Group-mode expired, no existing reservation")
             # if CB is active we need to remove Slurm reservation and start nodes
-            if capacity_block.is_active():
+            elif capacity_block.is_active():
                 # if Slurm reservation exists, delete it.
                 if reservation_exists:
                     _log_cb_info("Deleting")
@@ -307,7 +366,7 @@ class CapacityBlockManager:
                 else:
                     _log_cb_info("Nothing to do. No existing")
 
-            # if CB is expired or not active we need to (re)create Slurm reservation
+            # if CB is expired (1:1 mode) or not active we need to (re)create Slurm reservation
             # to avoid considering nodes as unhealthy
             else:
                 # create or update Slurm reservation
@@ -385,10 +444,13 @@ class CapacityBlockManager:
                     "Networking": {
                         "SubnetIds": ["subnet-123456"]
                     },
-                    "CapacityReservationId": "id"
+                    "CapacityReservationId": "id" or ["id1", "id2", ...]
                 }
             }
         }
+
+        CapacityReservationId can be either a single string (1:1 mode) or a list of strings
+        (group mode, when a GroupARN was resolved to individual CB IDs by the cookbook).
         """
         capacity_blocks: Dict[str, CapacityBlock] = {}
         logger.info("Retrieving Capacity Blocks from fleet configuration.")
@@ -396,17 +458,21 @@ class CapacityBlockManager:
         for queue_name, queue_config in self._fleet_config.items():
             for compute_resource_name, compute_resource_config in queue_config.items():
                 if self._is_compute_resource_associated_to_capacity_block(compute_resource_config):
-                    capacity_block_id = self._capacity_reservation_id_from_compute_resource_config(
+                    capacity_block_ids = self._capacity_reservation_ids_from_compute_resource_config(
                         compute_resource_config
                     )
-                    # retrieve existing CapacityBlock if exists or create a new one.
-                    capacity_block = capacity_blocks.get(
-                        capacity_block_id, CapacityBlock(capacity_block_id=capacity_block_id)
-                    )
-                    capacity_block.add_compute_resource(
-                        queue_name=queue_name, compute_resource_name=compute_resource_name
-                    )
-                    capacity_blocks.update({capacity_block_id: capacity_block})
+                    is_group_mode = len(capacity_block_ids) > 1
+
+                    for capacity_block_id in capacity_block_ids:
+                        # retrieve existing CapacityBlock if exists or create a new one.
+                        capacity_block = capacity_blocks.get(
+                            capacity_block_id,
+                            CapacityBlock(capacity_block_id=capacity_block_id, is_group_mode=is_group_mode),
+                        )
+                        capacity_block.add_compute_resource(
+                            queue_name=queue_name, compute_resource_name=compute_resource_name
+                        )
+                        capacity_blocks.update({capacity_block_id: capacity_block})
 
         return capacity_blocks
 
@@ -417,13 +483,20 @@ class CapacityBlockManager:
         return capacity_type == CapacityType.CAPACITY_BLOCK.value
 
     @staticmethod
-    def _capacity_reservation_id_from_compute_resource_config(compute_resource_config):
-        """Return capacity reservation target if present, None otherwise."""
-        try:
-            return compute_resource_config["CapacityReservationId"]
-        except KeyError as e:
-            # This should never happen because this file is created by cookbook config parser
+    def _capacity_reservation_ids_from_compute_resource_config(compute_resource_config):
+        """
+        Return list of capacity reservation IDs from compute resource config.
+
+        Supports both:
+        - Single string: "CapacityReservationId": "cr-123" (existing 1:1 mode)
+        - List of strings: "CapacityReservationId": ["cr-123", "cr-456"] (group mode from resolved GroupARN)
+        """
+        cr_id = compute_resource_config.get("CapacityReservationId")
+        if cr_id is None:
             logger.error(
                 "Unable to retrieve CapacityReservationId from compute resource info: %s", compute_resource_config
             )
-            raise e
+            raise KeyError("CapacityReservationId")
+        if isinstance(cr_id, list):
+            return cr_id
+        return [cr_id]
